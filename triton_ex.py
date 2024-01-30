@@ -14,7 +14,7 @@ from triton import language as tl
 from time import time
 import sys
 
-batch_size = 1
+batch_size = 16384
 num_embed_channels = 128
 num_heads = 4
 
@@ -76,6 +76,28 @@ def compute_softmax(inputs):
     return (exp / tl.sum(exp, axis=-1, keep_dims=True)).to(inputs.dtype)
 
 @triton.jit
+def compute_softmax_frac(inputs):
+    z = inputs - tl.max(inputs, axis=-1, keep_dims=True)
+    exp = tl.exp(z)
+
+    denom = tl.sum(exp, axis=-1, keep_dims=True)
+    return exp, denom
+
+@triton.jit
+def softmax_derivative(dO, softmax_numer, softmax_denom):
+    softmax_numer = softmax_numer.to(dO.dtype)
+    softmax_denom = softmax_denom.to(dO.dtype)
+
+    m = (1 / (softmax_denom * softmax_denom)).to(dO.dtype)
+    n = (dO * m).to(dO.dtype)
+    o = (n * softmax_numer).to(dO.dtype)
+    p = tl.sum(o, axis=-1, keep_dims=True)
+    s = dO / softmax_denom
+    v = s - p
+    return (v * softmax_numer).to(dO.dtype)
+
+
+@triton.jit
 def triton_short_sa_fwd_kernel(
     x_ptr,
     w_q_ptr,
@@ -112,17 +134,17 @@ def triton_short_sa_fwd_kernel(
 
         QK = tl.dot(Q_scaled, tl.trans(K)).to(x.dtype)
 
-        softmax = compute_softmax(QK)
+        A = compute_softmax(QK)
 
         ## Load v weights
         w_v = load_block(w_v_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
 
         V = tl.dot(x, w_v).to(x.dtype)
-        attention_head = tl.dot(softmax, V).to(x.dtype)
+        H = tl.dot(A, V).to(x.dtype)
 
         w_o = load_block(w_o_ptr, head_idx, qvk_head_dim, out_dim).to(x.dtype)
 
-        out = tl.dot(attention_head, w_o, out_dtype=accumulator.dtype)
+        out = tl.dot(H, w_o, out_dtype=accumulator.dtype)
         accumulator += out
 
     # Save results
@@ -162,8 +184,6 @@ def triton_short_sa_bwd_kernel(
         w_q = load_block(w_q_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
         w_k = load_block(w_k_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
 
-        # tl.dot outputs to fp32 by default, cannot accumulate to bf16, so must
-        # cast back to x.dtype
         Q = tl.dot(x, w_q).to(x.dtype)
         K = tl.dot(x, w_k).to(x.dtype)
 
@@ -171,35 +191,57 @@ def triton_short_sa_bwd_kernel(
 
         QK = tl.dot(Q_scaled, tl.trans(K)).to(x.dtype)
 
-        softmax = compute_softmax(QK)
+        softmax_numer, softmax_denom = compute_softmax_frac(QK)
+        A = (softmax_numer / softmax_denom).to(x.dtype)
 
-        ## Load v weights
         w_v = load_block(w_v_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
 
         V = tl.dot(x, w_v).to(x.dtype)
-        attention_head = tl.dot(softmax, V).to(x.dtype)
+        H = tl.dot(A, V).to(x.dtype)
 
-        d_w_o_head = tl.dot(tl.trans(attention_head), d_out).to(x.dtype)
+        d_w_o = tl.dot(tl.trans(H), d_out).to(x.dtype)
 
         # Write out d_w_o
-        atomic_accumulate_block(d_w_o_head,
+        atomic_accumulate_block(d_w_o,
             d_w_o_ptr, head_idx, qvk_head_dim, out_dim)
-
+        
         w_o = load_block(w_o_ptr, head_idx, qvk_head_dim, out_dim).to(x.dtype)
 
-        d_w_v_head = tl.dot(
-            tl.dot(
-                tl.trans(tl.dot(softmax, x).to(x.dtype)),
-                d_out).to(x.dtype),
-            tl.trans(w_o)).to(x.dtype)
+        d_H = tl.dot(d_out, tl.trans(w_o)).to(x.dtype)
+        d_V = tl.dot(tl.trans(A), d_H).to(x.dtype)
+        d_w_v = tl.dot(tl.trans(x), d_V).to(x.dtype)
 
         # Write out d_w_v
-        atomic_accumulate_block(d_w_v_head,
+        atomic_accumulate_block(d_w_v,
             d_w_v_ptr, head_idx, embed_dim, qvk_head_dim)
 
-        tl.dot(d_out, tl.trans(V))
+        # Accumulate the xWv part of the gradient wrt to x
+        d_x_accum += tl.dot(d_V, tl.trans(w_v), out_dtype=d_x_accum.dtype)
 
-    # Save results
+        d_A = tl.dot(d_H, tl.trans(V)).to(x.dtype)
+        d_QK = (softmax_derivative(d_A, softmax_numer, softmax_denom) * softmax_scale).to(x.dtype)
+
+        d_Q = tl.dot(d_QK, K).to(x.dtype)
+        d_w_q = tl.dot(tl.trans(x), d_Q).to(x.dtype)
+
+        # Write out d_w_q
+        atomic_accumulate_block(d_w_q,
+            d_w_q_ptr, head_idx, embed_dim, qvk_head_dim)
+
+        # Accumulate the xWq part of the gradient wrt to x
+        d_x_accum += tl.dot(d_Q, tl.trans(w_q), out_dtype=d_x_accum.dtype)
+
+        d_K = tl.dot(tl.trans(d_QK), Q).to(x.dtype)
+        d_w_k = tl.dot(tl.trans(x), d_K).to(x.dtype)
+
+        # Write out d_w_k
+        atomic_accumulate_block(d_w_k,
+            d_w_k_ptr, head_idx, embed_dim, qvk_head_dim)
+
+        # Accumulate the xWk part of the gradient wrt to x
+        d_x_accum += tl.dot(d_K, tl.trans(w_k), out_dtype=d_x_accum.dtype)
+
+    # Save input gradient
     store_block(d_x_accum, d_x_ptr, batch_elem, seq_len, embed_dim)
 
 class TritonShortSeqSelfAttention(torch.autograd.Function):
@@ -243,7 +285,7 @@ class TritonShortSeqSelfAttention(torch.autograd.Function):
             out_dim,
             softmax_scale,
             num_stages=1, # This controls loop unrolling
-            num_warps=4,
+            num_warps=16,
         )
 
         ctx.save_for_backward(x, w_q, w_k, w_v, w_o)
@@ -410,17 +452,6 @@ with torch.cuda.stream(s):
 
 torch.cuda.current_stream().wait_stream(s)
 
-with torch.no_grad():
-    print("Torch Grad")
-    print(torch_out[0])
-    print(txfm_in_proj_weight(torch_model.in_proj_weight.grad)[2])
-    
-    print("Triton Grad")
-    print(triton_out[0])
-    print(triton_model.w_v.grad)
-
-sys.exit(0)
-
 print()
 print("Torch")
 print(torch_out)
@@ -433,6 +464,9 @@ print(triton_out)
 
 with open('/tmp/triton_fwd.ptx', 'w') as f:
     print(list(triton_short_sa_fwd_kernel.cache[0].values())[0].asm['ptx'], file=f)
+
+with open('/tmp/triton_bwd.ptx', 'w') as f:
+    print(list(triton_short_sa_bwd_kernel.cache[0].values())[0].asm['ptx'], file=f)
 
 baseline_graph = torch.cuda.CUDAGraph()
 torch_optimizer.zero_grad(set_to_none=True)
@@ -448,6 +482,7 @@ with torch.cuda.graph(baseline_graph):
                               need_weights=False)
 
 flash_graph = torch.cuda.CUDAGraph()
+flash_optimizer.zero_grad(set_to_none=True)
 with torch.cuda.graph(flash_graph):
     if profile_backward:
         out = flash_model(fake_embed)
@@ -459,6 +494,7 @@ with torch.cuda.graph(flash_graph):
             out = flash_model(fake_embed)
 
 triton_graph = torch.cuda.CUDAGraph()
+triton_optimizer.zero_grad(set_to_none=True)
 with torch.cuda.graph(triton_graph):
     if profile_backward:
         out = triton_model(fake_embed)
@@ -471,45 +507,78 @@ with torch.cuda.graph(triton_graph):
 
 num_iters = 1000
 
+#with torch.no_grad():
+#    torch.cuda.synchronize()
+#
+#    start = time()
+#    for i in range(num_iters):
+#        baseline_graph.replay()
+#
+#    torch.cuda.synchronize()
+#    end = time()
+#
+#    diff = end - start
+#
+#    print("Torch ", batch_size * num_iters / diff)
+#
+#
+#with torch.no_grad():
+#    torch.cuda.synchronize()
+#
+#    start = time()
+#    for i in range(num_iters):
+#        flash_graph.replay()
+#
+#    torch.cuda.synchronize()
+#    end = time()
+#
+#    diff = end - start
+#
+#    print("Flash ", batch_size * num_iters / diff)
+#
+#with torch.no_grad():
+#    torch.cuda.synchronize()
+#
+#    start = time()
+#    for i in range(num_iters):
+#        triton_graph.replay()
+#
+#    torch.cuda.synchronize()
+#    end = time()
+#
+#    diff = end - start
+#
+#    print("Triton", batch_size * num_iters / diff)
+
+class FakeContext:
+    def __init__(self, model):
+        self.saved_tensors = [fake_embed, model.w_q, model.w_k, model.w_v, model.w_o]
+
+    def save_for_backward(self, *args):
+        pass
+
+fake_ctx = FakeContext(triton_model)
+
+TritonShortSeqSelfAttention.forward(fake_ctx, fake_embed,
+                                    triton_model.w_q, triton_model.w_k,
+                                    triton_model.w_v, triton_model.w_o)
+
+TritonShortSeqSelfAttention.backward(fake_ctx, fake_embed)
+
 with torch.no_grad():
     torch.cuda.synchronize()
 
     start = time()
     for i in range(num_iters):
-        baseline_graph.replay()
+        #TritonShortSeqSelfAttention.forward(fake_ctx, fake_embed,
+        #                                    triton_model.w_q, triton_model.w_k,
+        #                                    triton_model.w_v, triton_model.w_o)
+        TritonShortSeqSelfAttention.backward(fake_ctx, fake_embed)
+        #triton_graph.replay()
 
     torch.cuda.synchronize()
     end = time()
 
     diff = end - start
 
-    print("Torch ", batch_size * num_iters / diff)
-
-
-with torch.no_grad():
-    torch.cuda.synchronize()
-
-    start = time()
-    for i in range(num_iters):
-        flash_graph.replay()
-
-    torch.cuda.synchronize()
-    end = time()
-
-    diff = end - start
-
-    print("Flash ", batch_size * num_iters / diff)
-
-with torch.no_grad():
-    torch.cuda.synchronize()
-
-    start = time()
-    for i in range(num_iters):
-        triton_graph.replay()
-
-    torch.cuda.synchronize()
-    end = time()
-
-    diff = end - start
-
-    print("Triton", batch_size * num_iters / diff)
+    print("Strip ", batch_size * num_iters / diff)
