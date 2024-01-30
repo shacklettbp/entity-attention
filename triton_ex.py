@@ -150,6 +150,7 @@ def triton_short_sa_fwd_kernel(
     # Save results
     store_block(accumulator.to(x.dtype), out_ptr, batch_elem, seq_len, out_dim)
 
+
 @triton.jit
 def triton_short_sa_bwd_kernel(
     d_out_ptr, 
@@ -180,7 +181,6 @@ def triton_short_sa_bwd_kernel(
     d_x_accum = tl.zeros((seq_len, embed_dim), dtype=tl.float32)
 
     for head_idx in range(0, num_heads):
-        # Load weights for qk projection
         w_q = load_block(w_q_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
         w_k = load_block(w_k_ptr, head_idx, embed_dim, qvk_head_dim).to(x.dtype)
 
@@ -285,7 +285,7 @@ class TritonShortSeqSelfAttention(torch.autograd.Function):
             out_dim,
             softmax_scale,
             num_stages=1, # This controls loop unrolling
-            num_warps=16,
+            num_warps=4,
         )
 
         ctx.save_for_backward(x, w_q, w_k, w_v, w_o)
@@ -440,10 +440,10 @@ with torch.cuda.stream(s):
     torch_loss.backward()
     torch_optimizer.step()
 
-    flash_out = flash_model(fake_embed, max_seqlen = fake_embed.shape[1])
-    flash_loss = loss_fn(flash_out, fake_embed)
-    flash_loss.backward()
-    flash_optimizer.step()
+    #flash_out = flash_model(fake_embed, max_seqlen = fake_embed.shape[1])
+    #flash_loss = loss_fn(flash_out, fake_embed)
+    #flash_loss.backward()
+    #flash_optimizer.step()
 
     triton_out = triton_model(fake_embed)
     triton_loss = loss_fn(triton_out, fake_embed)
@@ -456,17 +456,17 @@ print()
 print("Torch")
 print(torch_out)
 print()
-print("Flash")
-print(flash_out)
-print()
+#print("Flash")
+#print(flash_out)
+#print()
 print("Triton")
 print(triton_out)
 
 with open('/tmp/triton_fwd.ptx', 'w') as f:
     print(list(triton_short_sa_fwd_kernel.cache[0].values())[0].asm['ptx'], file=f)
 
-with open('/tmp/triton_bwd.ptx', 'w') as f:
-    print(list(triton_short_sa_bwd_kernel.cache[0].values())[0].asm['ptx'], file=f)
+#with open('/tmp/triton_bwd.ptx', 'w') as f:
+#    print(list(triton_short_sa_bwd_kernel.cache[0].values())[0].asm['ptx'], file=f)
 
 baseline_graph = torch.cuda.CUDAGraph()
 torch_optimizer.zero_grad(set_to_none=True)
@@ -481,17 +481,17 @@ with torch.cuda.graph(baseline_graph):
             out = torch_model(fake_embed, fake_embed, fake_embed,
                               need_weights=False)
 
-flash_graph = torch.cuda.CUDAGraph()
-flash_optimizer.zero_grad(set_to_none=True)
-with torch.cuda.graph(flash_graph):
-    if profile_backward:
-        out = flash_model(fake_embed)
-        loss = loss_fn(out, fake_embed)
-        loss.backward()
-        flash_optimizer.step()
-    else:
-        with torch.no_grad():
-            out = flash_model(fake_embed)
+#flash_graph = torch.cuda.CUDAGraph()
+#flash_optimizer.zero_grad(set_to_none=True)
+#with torch.cuda.graph(flash_graph):
+#    if profile_backward:
+#        out = flash_model(fake_embed)
+#        loss = loss_fn(out, fake_embed)
+#        loss.backward()
+#        flash_optimizer.step()
+#    else:
+#        with torch.no_grad():
+#            out = flash_model(fake_embed)
 
 triton_graph = torch.cuda.CUDAGraph()
 triton_optimizer.zero_grad(set_to_none=True)

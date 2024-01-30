@@ -7,16 +7,17 @@ from flax.core import FrozenDict, frozen_dict
 
 from typing import List, Callable, Any
 from functools import partial
+from time import time
 
 import madrona_learn
 from madrona_learn.models import EntitySelfAttentionNet, SelfAttention as FlaxSelfAttention
 
 madrona_learn.init(0.6)
 
-batch_size = 2
+batch_size = 16384
 num_embed_channels = 64
 num_out_channels = 64
-num_heads = 1
+num_heads = 4
 
 float_dtype = jnp.float32
 
@@ -63,56 +64,61 @@ def make_net(attention_cls, attention_only):
     return model, params
 
 
-def pallas_fused_short_sa_kernel(x_ref, w_qkv_ref, w_o_ref, out_ref):
-    # Load input from DRAM. This will hopefully stay in SRAM while each head
-    # performs attention
+# Forward pass
+
+def pallas_fused_short_sa_kernel(x_ref, w_q_ref, w_k_ref, w_v_ref, w_o_ref, out_ref):
+    # Load input into SRAM. 
     x = x_ref[...]
 
-    num_heads = w_qkv_ref.shape[0]
+    num_heads = w_q_ref.shape[0]
 
     def compute_softmax(inputs):
         z = inputs - jnp.max(inputs, axis=-1, keepdims=True)
 
         exp = jnp.exp(z)
-        return exp / jnp.sum(exp, axis=-1, dtype=jnp.float32, keepdims=True).astype(exp.dtype)
+        return (exp / jnp.sum(exp, axis=-1,
+            dtype=jnp.float32, keepdims=True)).astype(inputs.dtype)
 
-    accumulator = jnp.zeros(out_ref.shape, dtype=jnp.float32)
-    def single_head_attention(head_idx, accumulator):
+    def attention_head_loop(head_idx, accumulator):
         # Load weights for qk projection
-        w_q = pl.load(w_qkv_ref, (head_idx, 0)).astype(x.dtype)
-        w_k = pl.load(w_qkv_ref, (head_idx, 1)).astype(x.dtype)
+        w_q = w_q_ref[head_idx].astype(x.dtype)
+        w_k = w_k_ref[head_idx].astype(x.dtype)
 
         Q = x @ w_q
         K = x @ w_k
 
-        QK = Q @ K.T
+        Q_scaled = Q / jnp.sqrt(K.shape[-1])
 
-        softmax = compute_softmax(QK / jnp.sqrt(K.shape[-1]).astype(QK.dtype))
+        QK = Q_scaled @ K.T
 
-        ## Load v weights
-        w_v = pl.load(w_qkv_ref, (head_idx, 2)).astype(x.dtype)
+        A = compute_softmax(QK)
+
+        # Load v weights
+        w_v = w_v_ref[head_idx].astype(x.dtype)
+
         V = x @ w_v
+        H = A @ V
 
-        attention = softmax @ V
-
-        w_o = pl.load(w_o_ref, (head_idx,)).astype(x.dtype)
-        out = attention @ w_o
+        w_o = w_o_ref[head_idx].astype(x.dtype)
+        out = H @ w_o
 
         accumulator = accumulator + out.astype(accumulator.dtype)
         return accumulator
 
+    accumulator = jnp.zeros(out_ref.shape, dtype=jnp.float32)
     accumulator = lax.fori_loop(
-        0, num_heads, single_head_attention, accumulator)
+        0, num_heads, attention_head_loop, accumulator)
 
-    # Save results to DRAM
+    # Save accumulated results to memory
     out_ref[...] = accumulator.astype(out_ref.dtype)
 
-def pallas_fused_short_sa_call(x, w_qkv, w_o, out_shape):
+
+def pallas_fused_short_sa_call(x, w_q, w_k, w_v, w_o, out_shape):
     x_spec = pl.BlockSpec(
         lambda i: (i, 0, 0), (None, x.shape[-2], x.shape[-1]))
 
     w_qkv_spec = pl.BlockSpec(
-        lambda _: (0, 0, 0, 0), w_qkv.shape)
+        lambda _: (0, 0, 0), w_q.shape)
 
     w_o_spec = pl.BlockSpec(
         lambda _: (0, 0, 0), w_o.shape)
@@ -120,7 +126,7 @@ def pallas_fused_short_sa_call(x, w_qkv, w_o, out_shape):
     o_spec = pl.BlockSpec(
         lambda i: (i, 0, 0), (None, out_shape[-2], out_shape[-1]))
 
-    in_specs = [x_spec, w_qkv_spec, w_o_spec]
+    in_specs = [x_spec, w_qkv_spec, w_qkv_spec, w_qkv_spec, w_o_spec]
 
     return pl.pallas_call(
         pallas_fused_short_sa_kernel,
@@ -128,7 +134,109 @@ def pallas_fused_short_sa_call(x, w_qkv, w_o, out_shape):
         in_specs = in_specs,
         out_specs = o_spec,
         out_shape = jax.ShapeDtypeStruct(shape=out_shape, dtype=x.dtype),
-    )(x, w_qkv, w_o)
+    )(x, w_q, w_k, w_v, w_o)
+
+
+# Backward pass
+
+def pallas_fused_short_sa_bwd_kernel(
+    # Gradient input
+    d_out_ref,
+    # Forward pass results
+    x_ref, 
+    w_q_ref,
+    w_k_ref,
+    w_v_ref,
+    w_o_ref,
+    # Gradient outputs
+    d_x_ref, 
+    d_w_q_ref,
+    d_w_k_ref,
+    d_w_v_ref,
+    d_w_o_ref,
+):
+    # Load input into SRAM. 
+    x = x_ref[...]
+    d_out = d_out_ref[...]
+
+    num_heads = w_q_ref.shape[0]
+
+    def compute_softmax(inputs):
+        z = inputs - jnp.max(inputs, axis=-1, keepdims=True)
+
+        exp = jnp.exp(z)
+        return exp / jnp.sum(exp, axis=-1, dtype=jnp.float32, keepdims=True).astype(exp.dtype)
+
+    def compute_attention_head(x, w_q, w_k, w_v, w_o):
+        Q = x @ w_q
+        K = x @ w_k
+
+        Q_scaled = Q / jnp.sqrt(K.shape[-1])
+
+        QK = Q_scaled @ K.T
+
+        A = compute_softmax(QK)
+
+        V = x @ w_v
+        H = A @ V
+
+        return H @ w_o
+
+    def head_gradient_loop(head_idx, d_x_accum):
+        # Load weights
+        w_q = w_q_ref[head_idx].astype(x.dtype)
+        w_k = w_k_ref[head_idx].astype(x.dtype)
+        w_v = w_v_ref[head_idx].astype(x.dtype)
+        w_o = w_o_ref[head_idx].astype(x.dtype)
+
+        # Use jax VJP transform to compute gradients
+        _, compute_head_vjp = jax.vjp(compute_attention_head, x, w_q, w_k, w_v, w_o)
+        d_x, d_w_q, d_w_k, d_w_v, d_w_o = compute_head_vjp(d_out)
+
+        # Use atomics to accumulate weight gradients
+        pl.atomic_add(d_w_q_ref, (head_idx,), d_w_q)
+        pl.atomic_add(d_w_k_ref, (head_idx,), d_w_k)
+        pl.atomic_add(d_w_v_ref, (head_idx,), d_w_v)
+        pl.atomic_add(d_w_o_ref, (head_idx,), d_w_o)
+
+        d_x_accum = d_x_accum + d_x.astype(d_x_accum.dtype)
+        return d_x_accum 
+
+    d_x_accum = jnp.zeros(d_x_ref.shape, dtype=jnp.float32)
+    d_x_accum = lax.fori_loop(
+        0, num_heads, head_gradient_loop, d_x_accum)
+
+    d_x_ref[...] = d_x_accum
+
+
+def pallas_fused_short_sa_bwd_call(d_out, x, w_q, w_k, w_v, w_o):
+    x_spec = pl.BlockSpec(
+        lambda i: (i, 0, 0), (None, x.shape[-2], x.shape[-1]))
+
+    w_qkv_spec = pl.BlockSpec(
+        lambda _: (0, 0, 0), w_q.shape)
+
+    w_o_spec = pl.BlockSpec(
+        lambda _: (0, 0, 0), w_o.shape)
+
+    o_spec = pl.BlockSpec(
+        lambda i: (i, 0, 0), (None, d_out.shape[-2], d_out.shape[-1]))
+
+    in_specs = [o_spec, x_spec, w_qkv_spec, w_qkv_spec, w_qkv_spec, w_o_spec]
+
+    out_specs = [x_spec, w_qkv_spec, w_qkv_spec, w_qkv_spec, w_o_spec]
+
+    out_shapes = [x.shape, w_q.shape, w_k.shape, w_v.shape, w_o.shape]
+
+    out_shapes = [jax.ShapeDtypeStruct(shape=s, dtype=x.dtype) for s in out_shapes]
+
+    return pl.pallas_call(
+        pallas_fused_short_sa_bwd_kernel,
+        grid = (batch_size),
+        in_specs = in_specs,
+        out_specs = out_specs,
+        out_shape = out_shapes,
+    )(d_out, x, w_q, w_k, w_v, w_o)
 
 
 class PallasShortSeqSelfAttention(nn.Module):
@@ -151,7 +259,6 @@ class PallasShortSeqSelfAttention(nn.Module):
 
         w_qkv_shape = (
             self.num_heads,
-            3,
             self.qkv_features,
             self.qkv_features // self.num_heads,
         )
@@ -162,7 +269,15 @@ class PallasShortSeqSelfAttention(nn.Module):
             self.out_features,
         )
 
-        w_qkv = self.param('w_qkv',
+        w_q = self.param('w_q',
+            lambda rng, shape: nn.initializers.lecun_normal()(
+                rng, shape, jnp.float32), w_qkv_shape)
+
+        w_k = self.param('w_k',
+            lambda rng, shape: nn.initializers.lecun_normal()(
+                rng, shape, jnp.float32), w_qkv_shape)
+
+        w_v = self.param('w_v',
             lambda rng, shape: nn.initializers.lecun_normal()(
                 rng, shape, jnp.float32), w_qkv_shape)
         
@@ -170,7 +285,7 @@ class PallasShortSeqSelfAttention(nn.Module):
             lambda rng, shape: nn.initializers.lecun_normal()(
                 rng, shape, jnp.float32), w_o_shape)
 
-        out = pallas_fused_short_sa_call(x, w_qkv, w_o,
+        out = pallas_fused_short_sa_call(x, w_q, w_k, w_v, w_o,
             (x.shape[0], seq_len + pad_amount, self.out_features))
 
         if pad_amount > 0:
@@ -191,21 +306,37 @@ def test_flax(params, *inputs):
 def test_pallas(params, *inputs):
     return pallas_model.apply(params, *inputs)
 
-qvk_flax_params = jnp.stack([
-        jnp.transpose(flax_params['params']['SelfAttention_0']['query']['kernel'], (1, 0, 2)),
-        jnp.transpose(flax_params['params']['SelfAttention_0']['key']['kernel'], (1, 0, 2)),
-        jnp.transpose(flax_params['params']['SelfAttention_0']['value']['kernel'], (1, 0, 2)),
-    ], axis = 1)
-
 pallas_params['params']['out_weights'] = \
     flax_params['params']['SelfAttention_0']['out']['kernel']
 
-pallas_params['params']['qkv_weights'] = qvk_flax_params
+pallas_params['params']['w_q'] = \
+    jnp.transpose(flax_params['params']['SelfAttention_0']['query']['kernel'], (1, 0, 2))
+pallas_params['params']['w_k'] = \
+    jnp.transpose(flax_params['params']['SelfAttention_0']['key']['kernel'], (1, 0, 2))
+pallas_params['params']['w_v'] = \
+    jnp.transpose(flax_params['params']['SelfAttention_0']['value']['kernel'], (1, 0, 2))
 
 flax_out = test_flax(flax_params, fake_embed)
 pallas_out = test_pallas(pallas_params, fake_embed)
+
+
+pallas_fused_short_sa_bwd_call(
+    pallas_out, fake_embed,
+    pallas_params['params']['w_q'],
+    pallas_params['params']['w_k'],
+    pallas_params['params']['w_v'],
+    pallas_params['params']['w_o'])
 
 print(flax_out[0, 0])
 print(pallas_out[0, 0])
 
 print(pallas_out.shape)
+
+#start = time()
+#for i in range(1000):
+#    out = test_pallas(pallas_params, fake_embed)
+#
+#jax.block_until_ready(out)
+#end = time()
+
+print("Pallas", batch_size * 1000 / (end - start))
