@@ -32,12 +32,23 @@ batch_size = 16384
 num_channels = 128
 seq_len = 16
 
-jaxpr = make_jaxpr_fn(
+fake_inputs = [
     jax.ShapeDtypeStruct(shape=(seq_len, num_channels), dtype=jnp.float16),
     jax.ShapeDtypeStruct(shape=(seq_len, num_channels), dtype=jnp.float16),
     jax.ShapeDtypeStruct(shape=(num_channels, num_channels), dtype=jnp.float16),
     jax.ShapeDtypeStruct(shape=(num_channels, num_channels), dtype=jnp.float16),
     jax.ShapeDtypeStruct(shape=(num_channels, num_channels), dtype=jnp.float16),
-    jax.ShapeDtypeStruct(shape=(num_channels, num_channels), dtype=jnp.float16))
+    jax.ShapeDtypeStruct(shape=(num_channels, num_channels), dtype=jnp.float16),
+]
 
+jaxpr = make_jaxpr_fn(*fake_inputs)
+
+print("jaxpr:")
 print(jaxpr)
+
+input()
+print("XLA:")
+
+compiled = jax.jit(compute_partial_gradient).lower(*fake_inputs).compile()
+
+print(compiled.as_text())
